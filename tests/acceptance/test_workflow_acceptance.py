@@ -111,7 +111,7 @@ def test_export_writing_corpus_writes_manifest_and_curates_rooms():
         assert len(chat_files) == 1
         assert "Arthur takes responsibility" in chat_files[0].read_text(encoding="utf-8")
         assert (output_root / ".gitignore").read_text(encoding="utf-8") == (
-            f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n"
+            f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n.writing-sidecar-verify.json\nfacts/\nhealth/\n"
         )
         assert summary["last_synced_at"]
         assert manifest["project"] == "Witcher-DC"
@@ -3241,6 +3241,77 @@ def test_build_writing_automation_skips_sidecar_queries_when_health_marks_backen
         cleanup_temp_dir(tmp_path)
 
 
+def test_build_writing_automation_does_not_skip_sidecar_queries_for_stale_p95_only(monkeypatch):
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "Witcher-DC"
+        output_root = tmp_path / "sidecar"
+        palace_root = tmp_path / "palace"
+        runtime_root = tmp_path / "runtime"
+
+        write_file(project_root / "writing-sidecar.yaml", "brainstorms: []\naudits: []\ndiscarded_paths: []\n")
+        write_file(
+            project_root / "_story_bible" / "05_Current_Notes.md",
+            "**Status:** CHAPTER 3 STABLE -> READY FOR CHAPTER 4\n**Next Action:** Continue the Darkseid prelude.\n",
+        )
+        write_file(
+            project_root / "_story_bible" / "05_Current_Chapter_Notes.md",
+            "**Phase:** SCRIPTING\n**Chapter:** 4\n",
+        )
+        write_file(project_root / "_story_bible" / "research" / "dc.md", "Apokolips research")
+
+        export_writing_corpus(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(output_root),
+            palace_path=str(palace_root),
+            runtime_root=str(runtime_root),
+        )
+        _ensure_dir(palace_root)
+
+        monkeypatch.setattr(
+            "writing_sidecar.workflow._cached_health_summary",
+            lambda *args, **kwargs: {
+                "health_metrics": {
+                    "command_families": {
+                        "query": {"sample_count": 43, "median_ms": 12977, "p95_ms": 194861}
+                    }
+                }
+            },
+        )
+
+        calls = []
+
+        def fake_search(**kwargs):
+            calls.append(kwargs)
+            return {
+                "query": kwargs["query"],
+                "wing": kwargs["wing"],
+                "mode": kwargs["mode"],
+                "room_order": list(SEARCH_MODE_ROOMS[kwargs["mode"]]),
+                "results": [],
+            }
+
+        monkeypatch.setattr("writing_sidecar.workflow.search_writing_sidecar", fake_search)
+
+        report = build_writing_automation(
+            str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(output_root),
+            palace_path=str(palace_root),
+            runtime_root=str(runtime_root),
+            name="recommended",
+            verify_mode="skip",
+            sync="never",
+        )
+
+        assert calls
+        assert not any("query backend is currently too slow" in warning for warning in report["warnings"])
+    finally:
+        cleanup_temp_dir(tmp_path)
+
+
 def test_export_writing_corpus_refresh_palace_resets_health_history(monkeypatch):
     tmp_path = make_temp_dir()
     try:
@@ -3279,18 +3350,23 @@ def test_export_writing_corpus_refresh_palace_resets_health_history(monkeypatch)
 def test_search_writing_sidecar_fast_path_works_without_search_memories(monkeypatch):
     import chromadb
 
+    queries = []
+
     class FakeCollection:
         def query(self, **kwargs):
+            queries.append(kwargs)
             return {
                 "documents": [[
                     "Arthur sponsorship and Atlantis intake.",
                     "Checkpoint mentions Atlantis intake.",
+                    "Older checkpoint also mentions Atlantis intake.",
                 ]],
                 "metadatas": [[
                     {"wing": "witcher_dc_writing_sidecar", "room": "brainstorms", "source_file": "handoff.md"},
                     {"wing": "witcher_dc_writing_sidecar", "room": "checkpoints", "source_file": "checkpoint.md"},
+                    {"wing": "witcher_dc_writing_sidecar", "room": "checkpoints", "source_file": "older-checkpoint.md"},
                 ]],
-                "distances": [[0.1, 0.2]],
+                "distances": [[0.1, 0.2, 0.3]],
             }
 
     class FakeClient:
@@ -3311,9 +3387,15 @@ def test_search_writing_sidecar_fast_path_works_without_search_memories(monkeypa
         palace_path="C:/fake-palace",
         wing="witcher_dc_writing_sidecar",
         mode="planning",
-        n_results=2,
+        n_results=3,
     )
 
     assert result["results"]
-    assert [hit["room"] for hit in result["results"]] == ["checkpoints", "brainstorms"]
+    assert [hit["room"] for hit in result["results"]] == ["checkpoints", "brainstorms", "checkpoints"]
+    assert queries[0]["where"] == {
+        "$and": [
+            {"wing": "witcher_dc_writing_sidecar"},
+            {"room": {"$in": list(SEARCH_MODE_ROOMS["planning"])}},
+        ]
+    }
 

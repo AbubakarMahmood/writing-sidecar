@@ -26,6 +26,7 @@ from typing import Iterable, Sequence
 import yaml
 
 from .health import (
+    HEALTH_DIRNAME,
     begin_health_command,
     command_family as health_command_family,
     describe_health_reason,
@@ -59,7 +60,7 @@ STATE_VERSION = 3
 DOCUMENT_ID_VERSION = 1
 DOCUMENT_TAG_VERSION = 1
 SEARCH_MODE_ROOMS = {
-    "planning": ("checkpoints", "brainstorms", "discarded_paths", "audits", "chat_process"),
+    "planning": ("checkpoints", "brainstorms", "discarded_paths", "audits"),
     "audit": ("audits", "discarded_paths", "checkpoints", "chat_process", "archived_notes"),
     "history": ("checkpoints", "audits", "brainstorms", "discarded_paths", "chat_process"),
     "research": ("research", "archived_notes"),
@@ -167,7 +168,6 @@ ROLLOUT_SCAN_MAX_BYTES = 16 * 1024 * 1024
 ROLLOUT_SCAN_MAX_LINES = 25000
 QUERY_BACKEND_SKIP_SAMPLE_COUNT = 3
 QUERY_BACKEND_SKIP_MEDIAN_MS = 15000
-QUERY_BACKEND_SKIP_P95_MS = 45000
 ROOM_DESCRIPTIONS = {
     "chat_process": "Normalized AI conversations and process chatter tied to this project.",
     "checkpoints": "Structured session-safe checkpoints captured during startup, planning, and closeout.",
@@ -1214,6 +1214,28 @@ def _merge_search_hits(keyword_hits: list[dict], vector_hits: list[dict], n_resu
     return merged
 
 
+def _prioritize_room_hits(rooms: Sequence[str], buckets: dict[str, list[dict]], mode: str) -> list[dict]:
+    per_room: dict[str, list[dict]] = {room: [] for room in rooms}
+    seen = set()
+    for room in rooms:
+        for hit in buckets.get(room, []):
+            key = (hit.get("source_file"), hit.get("text"))
+            if key in seen:
+                continue
+            seen.add(key)
+            hit["mode"] = mode
+            per_room[room].append(hit)
+
+    primary = []
+    deferred = []
+    for room in rooms:
+        if not per_room[room]:
+            continue
+        primary.append(per_room[room][0])
+        deferred.extend(per_room[room][1:])
+    return primary + deferred
+
+
 def search_writing_sidecar(
     query: str,
     palace_path: str,
@@ -1259,10 +1281,7 @@ def search_writing_sidecar(
             fast_packet["profile"] = explicit_profile
         return fast_packet
 
-    primary = []
-    deferred = []
-    seen = set()
-    seen_sources = set()
+    buckets = {room: [] for room in rooms}
     room_limit = _retrieval_room_limit(n_results, budget)
     for room in rooms:
         try:
@@ -1290,19 +1309,9 @@ def search_writing_sidecar(
         if results.get("error"):
             return results
         for hit in results.get("results", []):
-            key = (hit.get("source_file"), hit.get("text"))
-            if key in seen:
-                continue
-            seen.add(key)
-            hit["mode"] = mode
-            source_key = hit.get("source_file") or f"{room}:{len(seen)}"
-            if source_key not in seen_sources:
-                seen_sources.add(source_key)
-                primary.append(hit)
-            else:
-                deferred.append(hit)
+            buckets.setdefault(room, []).append(hit)
 
-    merged = _merge_search_hits(keyword_hits, primary + deferred, n_results, mode)
+    merged = _merge_search_hits(keyword_hits, _prioritize_room_hits(rooms, buckets, mode), n_results, mode)
 
     packet = {
         "query": query,
@@ -1333,7 +1342,7 @@ def _search_writing_sidecar_fast(
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         query_limit = _retrieval_candidate_limit(n_results, len(rooms), budget)
-        where = {"wing": wing} if wing else None
+        where = _sidecar_fast_where_filter(wing, rooms)
         kwargs = {
             "query_texts": [query],
             "n_results": query_limit,
@@ -1365,25 +1374,7 @@ def _search_writing_sidecar_fast(
             }
         )
 
-    primary = []
-    deferred = []
-    seen = set()
-    seen_sources = set()
-    for room in rooms:
-        for hit in buckets[room]:
-            key = (hit.get("source_file"), hit.get("text"))
-            if key in seen:
-                continue
-            seen.add(key)
-            hit["mode"] = mode
-            source_key = hit.get("source_file") or f"{room}:{len(seen)}"
-            if source_key not in seen_sources:
-                seen_sources.add(source_key)
-                primary.append(hit)
-            else:
-                deferred.append(hit)
-
-    merged = (primary + deferred)[:n_results]
+    merged = _prioritize_room_hits(rooms, buckets, mode)[:n_results]
     packet = {
         "query": query,
         "wing": wing,
@@ -1394,6 +1385,19 @@ def _search_writing_sidecar_fast(
     if budget != "normal":
         packet["budget"] = budget
     return packet
+
+
+def _sidecar_fast_where_filter(wing: str, rooms: Sequence[str]) -> dict | None:
+    clauses = []
+    if wing:
+        clauses.append({"wing": wing})
+    if rooms:
+        clauses.append({"room": {"$in": list(rooms)}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def print_writing_search_results(search_data: dict):
@@ -5962,8 +5966,7 @@ def _sidecar_query_circuit_breaker(status: dict) -> str | None:
         return None
 
     median_too_slow = median_ms is not None and median_ms >= QUERY_BACKEND_SKIP_MEDIAN_MS
-    p95_too_slow = p95_ms is not None and p95_ms >= QUERY_BACKEND_SKIP_P95_MS
-    if not (median_too_slow or p95_too_slow):
+    if not median_too_slow:
         return None
 
     return (
@@ -9339,7 +9342,10 @@ def _ensure_dir(path: Path):
 def _write_export_gitignore(output_root: Path):
     gitignore_path = output_root / ".gitignore"
     gitignore_path.write_text(
-        f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n",
+        (
+            f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n{VERIFY_CACHE_FILENAME}\n"
+            f"{FACTS_DIRNAME}/\n{HEALTH_DIRNAME}/\n"
+        ),
         encoding="utf-8",
     )
 
