@@ -168,6 +168,14 @@ ROLLOUT_SCAN_MAX_BYTES = 16 * 1024 * 1024
 ROLLOUT_SCAN_MAX_LINES = 25000
 QUERY_BACKEND_SKIP_SAMPLE_COUNT = 3
 QUERY_BACKEND_SKIP_MEDIAN_MS = 15000
+ONNX_MODEL_CACHE_FILES = (
+    "config.json",
+    "model.onnx",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "vocab.txt",
+)
 ROOM_DESCRIPTIONS = {
     "chat_process": "Normalized AI conversations and process chatter tied to this project.",
     "checkpoints": "Structured session-safe checkpoints captured during startup, planning, and closeout.",
@@ -9373,7 +9381,7 @@ def _sidecar_runtime_environment(runtime_root: Path):
     home_root = runtime_root / "home"
     cache_root = runtime_root / "cache"
     tmp_root = runtime_root / "tmp"
-    chroma_cache_root = cache_root / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+    chroma_cache_root = _onnx_model_cache_dir(runtime_root)
 
     for path in (runtime_root, home_root, cache_root, tmp_root, chroma_cache_root):
         _ensure_dir(path)
@@ -9433,6 +9441,47 @@ def _sidecar_runtime_environment(runtime_root: Path):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = old_value
+
+
+def _onnx_model_cache_dir(runtime_root: Path) -> Path:
+    return (
+        Path(runtime_root).expanduser().resolve()
+        / "cache"
+        / "chroma"
+        / "onnx_models"
+        / "all-MiniLM-L6-v2"
+    )
+
+
+def _check_onnx_model_cache(runtime_root: Path) -> tuple[str, Path, str]:
+    cache_dir = _onnx_model_cache_dir(runtime_root)
+    extracted_dir = cache_dir / "onnx"
+    missing = [name for name in ONNX_MODEL_CACHE_FILES if not (extracted_dir / name).exists()]
+    if not missing:
+        return "ok", cache_dir, "Chroma ONNX model cache is warm."
+
+    archive_path = cache_dir / "onnx.tar.gz"
+    if archive_path.exists():
+        try:
+            archive_size = archive_path.stat().st_size / (1024 * 1024)
+            archive_detail = f"archive exists ({archive_size:.1f} MB)"
+        except OSError:
+            archive_detail = "archive exists"
+        missing_preview = ", ".join(missing[:3])
+        if len(missing) > 3:
+            missing_preview += ", ..."
+        return (
+            "warn",
+            cache_dir,
+            "Chroma ONNX model cache is partial; "
+            f"{archive_detail}, but extracted files are missing: {missing_preview}.",
+        )
+
+    return (
+        "warn",
+        cache_dir,
+        "Chroma ONNX model cache is cold; the first embedding-backed run may download about 80 MB.",
+    )
 
 
 def doctor_writing_sidecar(
@@ -9556,6 +9605,16 @@ def doctor_writing_sidecar(
                 "detail": detail,
             }
         )
+
+    onnx_status, onnx_path, onnx_detail = _check_onnx_model_cache(context["runtime_root"])
+    checks.append(
+        {
+            "name": "onnx_model_cache",
+            "status": onnx_status,
+            "path": str(onnx_path),
+            "detail": onnx_detail,
+        }
+    )
 
     report = {
         "project": context["project"],

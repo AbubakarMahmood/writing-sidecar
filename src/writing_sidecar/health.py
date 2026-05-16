@@ -10,6 +10,7 @@ from pathlib import Path
 HEALTH_DIRNAME = "health"
 HEALTH_LATEST_FILENAME = "latest.json"
 HEALTH_HISTORY_FILENAME = "history.jsonl"
+HEALTH_SUMMARY_SCHEMA_VERSION = 2
 HEALTH_HISTORY_LIMIT = 200
 HEALTH_SUMMARY_WINDOW = 50
 HEALTH_MIN_SAMPLES = 5
@@ -119,11 +120,21 @@ def _median(values: list[int]) -> int | None:
 
 
 def _family_metrics(window: list[dict], family: str) -> dict:
-    values = [
-        int(event.get("duration_ms", 0))
-        for event in window
-        if event.get("command_family") == family and event.get("duration_ms") is not None
-    ]
+    values = []
+    for event in window:
+        if event.get("duration_ms") is None:
+            continue
+        sync_performed = bool(event.get("sync_performed"))
+        command_family = event.get("command_family")
+        if family == "sync":
+            if command_family != "sync" and not sync_performed:
+                continue
+        elif family == "query":
+            if command_family != "query" or sync_performed:
+                continue
+        elif command_family != family:
+            continue
+        values.append(int(event.get("duration_ms", 0)))
     if not values:
         return {"sample_count": 0, "median_ms": None, "p95_ms": None}
     return {
@@ -139,6 +150,7 @@ def _family_metrics(window: list[dict], family: str) -> dict:
 def _default_health_summary(output_root: Path, *, project=None, project_root=None, vault_root=None) -> dict:
     summary_path = health_latest_path(output_root)
     return {
+        "health_schema_version": HEALTH_SUMMARY_SCHEMA_VERSION,
         "project": project,
         "project_root": str(project_root) if project_root else None,
         "vault_root": str(vault_root) if vault_root else None,
@@ -264,7 +276,23 @@ def _build_health_summary(output_root: Path, *, project, project_root, vault_roo
 
 def load_health_summary(output_root: Path, *, project=None, project_root=None, vault_root=None) -> dict:
     output_root = Path(output_root).expanduser().resolve()
-    payload = _load_json_document(health_latest_path(output_root))
+    latest_path = health_latest_path(output_root)
+    payload = _load_json_document(latest_path)
+    if not payload or payload.get("health_schema_version") != HEALTH_SUMMARY_SCHEMA_VERSION:
+        events = _load_history(health_history_path(output_root))
+        if events:
+            payload = _build_health_summary(
+                output_root,
+                project=project,
+                project_root=project_root,
+                vault_root=vault_root,
+                events=events[-HEALTH_HISTORY_LIMIT:],
+            )
+            try:
+                _ensure_dir(latest_path.parent)
+                latest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except OSError:
+                pass
     if not payload:
         return _default_health_summary(
             output_root,
@@ -272,6 +300,7 @@ def load_health_summary(output_root: Path, *, project=None, project_root=None, v
             project_root=project_root,
             vault_root=vault_root,
         )
+    payload.setdefault("health_schema_version", HEALTH_SUMMARY_SCHEMA_VERSION)
     payload.setdefault("project", project)
     payload.setdefault("project_root", str(project_root) if project_root else None)
     payload.setdefault("vault_root", str(vault_root) if vault_root else None)
@@ -302,7 +331,7 @@ def command_family(command: str, *, sync_performed: bool = False) -> str:
     if command == "maintain":
         return "sync" if sync_performed else "maintenance"
     if command in {"search", "context", "recap", "verify", "session", "bundle", "routine", "automate"}:
-        return "query"
+        return "sync" if sync_performed else "query"
     return "other"
 
 

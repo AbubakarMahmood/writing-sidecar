@@ -35,6 +35,8 @@ TIMESTAMP_KEYS = {
 TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 DATE_STAMP_PATTERN = re.compile(r"\b\d{4}-\d{2}-\d{2}(?=_)")
 SHA256_PATTERN = re.compile(r"\b[a-fA-F0-9]{64}\b")
+MEMPALACE_VERSION_PATTERN = re.compile(r"\bMemPalace \d+\.\d+\.\d+\b")
+SUPPORTED_MEMPALACE_VERSION_PATTERN = re.compile(r"Supported MemPalace version detected \(\d+\.\d+\.\d+,")
 
 
 def write_file(path: Path, content: str):
@@ -239,12 +241,18 @@ def normalize_for_snapshot(payload, context: dict):
             return [normalize(item, key=key) for item in value]
         if isinstance(value, str):
             normalized = value
+            if key == "mempalace_version":
+                return "<MEMPALACE_VERSION>"
             for actual, placeholder in replacements:
                 normalized = normalized.replace(actual, placeholder)
                 normalized = normalized.replace(actual.replace("\\", "/"), placeholder)
             normalized = TIMESTAMP_PATTERN.sub("<TIMESTAMP>", normalized)
             normalized = DATE_STAMP_PATTERN.sub("<DATE>", normalized)
             normalized = SHA256_PATTERN.sub("<SHA256>", normalized)
+            normalized = MEMPALACE_VERSION_PATTERN.sub("MemPalace <MEMPALACE_VERSION>", normalized)
+            normalized = SUPPORTED_MEMPALACE_VERSION_PATTERN.sub(
+                "Supported MemPalace version detected (<MEMPALACE_VERSION>,", normalized
+            )
             return normalized
         return value
 

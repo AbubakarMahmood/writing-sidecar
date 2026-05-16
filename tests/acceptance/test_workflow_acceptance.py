@@ -11,6 +11,7 @@ from writing_sidecar.workflow import (
     FACT_LOG_FILENAME,
     FACT_PREVIEW_FILENAME,
     FACTS_SNAPSHOT_FILENAME,
+    ONNX_MODEL_CACHE_FILES,
     STATE_FILENAME,
     _collect_carry_forward_gap_findings,
     _build_checkpoint_sections,
@@ -1025,6 +1026,7 @@ def test_doctor_reports_supported_version_and_writable_paths(monkeypatch, capsys
         assert report["supported_spec"] == SUPPORTED_MEMPALACE_SPEC
         assert any(item["name"] == "mempalace_version" and item["status"] == "ok" for item in report["checks"])
         assert any(item["name"] == "codex_home" and item["status"] == "warn" for item in report["checks"])
+        assert any(item["name"] == "onnx_model_cache" and item["status"] == "warn" for item in report["checks"])
         assert report["assistant_ready"] is True
         assert all(item["status"] == "ok" for item in report["workflow_checks"])
         assert report["recommended_entrypoint"] == "writing-sidecar automate"
@@ -1034,6 +1036,37 @@ def test_doctor_reports_supported_version_and_writable_paths(monkeypatch, capsys
         assert "Writing Sidecar Doctor" in output
     finally:
         cleanup_temp_dir(tmp_path)
+
+
+def test_doctor_reports_warm_onnx_model_cache(monkeypatch):
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "Witcher-DC"
+        runtime_root = tmp_path / "runtime"
+        extracted_cache = runtime_root / "cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2" / "onnx"
+        for filename in ONNX_MODEL_CACHE_FILES:
+            write_file(extracted_cache / filename, "cached")
+
+        _ensure_dir(project_root)
+        scaffold_writing_sidecar(str(vault_root), "Witcher-DC")
+        write_file(project_root / "AGENTS.md", "gateway")
+        write_file(project_root / "_story_bible" / "05_Current_Notes.md", "**Status:** READY FOR SCRIPTING\n")
+        write_file(project_root / "_story_bible" / "05_Current_Chapter_Notes.md", "**Phase:** SCRIPTING\n")
+
+        report = doctor_writing_sidecar(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            codex_home=str(tmp_path / ".codex"),
+            runtime_root=str(runtime_root),
+        )
+        onnx_check = next(item for item in report["checks"] if item["name"] == "onnx_model_cache")
+
+        assert onnx_check["status"] == "ok"
+        assert "warm" in onnx_check["detail"]
+    finally:
+        cleanup_temp_dir(tmp_path)
+
 
 def test_doctor_auto_resolves_project_name_from_project_dir():
     tmp_path = make_temp_dir()
@@ -3398,4 +3431,3 @@ def test_search_writing_sidecar_fast_path_works_without_search_memories(monkeypa
             {"room": {"$in": list(SEARCH_MODE_ROOMS["planning"])}},
         ]
     }
-

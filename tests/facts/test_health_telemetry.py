@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from writing_sidecar.health import load_health_summary, record_health_event
+from writing_sidecar.health import command_family, health_latest_path, load_health_summary, record_health_event
 
 
 def _emit_health_event(
@@ -90,6 +91,62 @@ def test_query_latency_watch_stays_watch_without_backend_review(tmp_path):
     assert "query_latency_watch" in summary["health_reasons"]
     assert summary["backend_review_due"] is False
     assert summary["health_metrics"]["command_families"]["query"]["median_ms"] == 7000
+
+
+def test_query_commands_that_sync_count_as_sync_latency_not_query_latency(tmp_path):
+    output_root = tmp_path / ".sidecars" / "demo"
+
+    for _ in range(5):
+        summary = _emit_health_event(
+            output_root,
+            command="automate",
+            command_family="query",
+            duration_ms=70000,
+            sync_performed=True,
+        )
+
+    families = summary["health_metrics"]["command_families"]
+    assert families["sync"]["sample_count"] == 5
+    assert families["sync"]["median_ms"] == 70000
+    assert families["query"]["sample_count"] == 0
+    assert "sync_latency_review" in summary["health_reasons"]
+    assert "query_latency_review" not in summary["health_reasons"]
+
+
+def test_command_family_routes_query_commands_with_sync_to_sync():
+    assert command_family("automate", sync_performed=True) == "sync"
+    assert command_family("automate", sync_performed=False) == "query"
+
+
+def test_load_health_summary_migrates_stale_query_metrics_from_history(tmp_path):
+    output_root = tmp_path / ".sidecars" / "demo"
+
+    for _ in range(5):
+        summary = _emit_health_event(
+            output_root,
+            command="automate",
+            command_family="query",
+            duration_ms=70000,
+            sync_performed=True,
+        )
+
+    stale_summary = dict(summary)
+    stale_summary["health_schema_version"] = 1
+    stale_summary["health_reasons"] = ["query_latency_review"]
+    stale_summary["health_metrics"]["command_families"]["query"] = {
+        "sample_count": 5,
+        "median_ms": 70000,
+        "p95_ms": None,
+    }
+    health_latest_path(output_root).write_text(json.dumps(stale_summary), encoding="utf-8")
+
+    loaded = load_health_summary(output_root)
+
+    families = loaded["health_metrics"]["command_families"]
+    assert loaded["health_schema_version"] == 2
+    assert families["sync"]["sample_count"] == 5
+    assert families["query"]["sample_count"] == 0
+    assert "query_latency_review" not in loaded["health_reasons"]
 
 
 def test_single_slow_sync_sample_does_not_trigger_backend_review(tmp_path):
