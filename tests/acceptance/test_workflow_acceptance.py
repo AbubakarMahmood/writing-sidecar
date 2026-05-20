@@ -3183,6 +3183,49 @@ def test_export_writing_corpus_records_mine_backend_failures(monkeypatch):
         cleanup_temp_dir(tmp_path)
 
 
+def test_export_writing_corpus_records_mine_timeout_from_config(monkeypatch):
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "Witcher-DC"
+        output_root = tmp_path / "sidecar"
+        palace_root = tmp_path / "palace"
+        runtime_root = tmp_path / "runtime"
+        captured = {}
+
+        write_file(
+            project_root / "writing-sidecar.yaml",
+            "backend:\n  mine_timeout_seconds: 1\nbrainstorms: []\naudits: []\ndiscarded_paths: []\n",
+        )
+        write_file(project_root / "_story_bible" / "research" / "dc.md", "Apokolips research")
+
+        def timed_out_run(command, **kwargs):
+            captured["command"] = command
+            captured["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+        monkeypatch.setattr("writing_sidecar.workflow.subprocess.run", timed_out_run)
+
+        summary = export_writing_corpus(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(output_root),
+            palace_path=str(palace_root),
+            runtime_root=str(runtime_root),
+            mine_after_export=True,
+        )
+
+        assert summary["mine_skipped"] == "backend_error"
+        assert "mine backend failure" in summary["mine_warning"]
+        assert "TimeoutExpired" in summary["mine_warning"]
+        assert captured["timeout"] == 1
+        assert "--wing" in captured["command"]
+        assert any("_writing_sidecar" in item for item in captured["command"])
+        assert (output_root / STATE_FILENAME).exists()
+    finally:
+        cleanup_temp_dir(tmp_path)
+
+
 def test_verify_writing_sidecar_survives_search_backend_failures(monkeypatch):
     tmp_path = make_temp_dir()
     try:

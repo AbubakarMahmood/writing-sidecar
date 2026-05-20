@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import hashlib
 from contextlib import contextmanager
@@ -656,6 +657,7 @@ def _prepare_writing_context(
         project_root=project_root,
         project=project_name,
     )
+    mine_timeout_seconds = _resolve_mine_timeout_seconds(writing_config)
     output_root = (
         Path(out_dir).expanduser().resolve()
         if out_dir
@@ -705,6 +707,7 @@ def _prepare_writing_context(
         "codex_root": codex_root,
         "palace_path": target_palace,
         "runtime_root": sidecar_runtime_root,
+        "mine_timeout_seconds": mine_timeout_seconds,
         "writing_config": writing_config,
         "loaded_config_path": loaded_config_path,
         "generated_config_path": output_root / "mempalace.yaml",
@@ -874,13 +877,16 @@ def export_writing_corpus(
         if dry_run:
             summary["mine_skipped"] = "dry_run"
         else:
-            mine_warning = _mine_exported_sidecar(
-                output_root=context["output_root"],
-                project=context["project"],
-                palace_path=context["palace_path"],
-                runtime_root=context["runtime_root"],
-                refresh_palace=refresh_palace,
-            )
+            mine_kwargs = {
+                "output_root": context["output_root"],
+                "project": context["project"],
+                "palace_path": context["palace_path"],
+                "runtime_root": context["runtime_root"],
+                "refresh_palace": refresh_palace,
+            }
+            if context["mine_timeout_seconds"] is not None:
+                mine_kwargs["timeout_seconds"] = context["mine_timeout_seconds"]
+            mine_warning = _mine_exported_sidecar(**mine_kwargs)
             if mine_warning:
                 summary["mine_skipped"] = "backend_error"
                 summary["mine_warning"] = mine_warning
@@ -7859,6 +7865,30 @@ def _resolve_config_path_value(
     return candidate.resolve()
 
 
+def _resolve_mine_timeout_seconds(writing_config: dict) -> float | None:
+    backend_config = writing_config.get("backend", {})
+    if backend_config is None:
+        backend_config = {}
+    if not isinstance(backend_config, dict):
+        raise ValueError("Writing sidecar backend config must be a mapping")
+
+    raw_timeout = backend_config.get(
+        "mine_timeout_seconds",
+        writing_config.get("mine_timeout_seconds"),
+    )
+    if raw_timeout in (None, ""):
+        return None
+    if raw_timeout is False:
+        return None
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Writing sidecar backend.mine_timeout_seconds must be a number") from exc
+    if timeout <= 0:
+        raise ValueError("Writing sidecar backend.mine_timeout_seconds must be greater than zero")
+    return timeout
+
+
 def _infer_vault_root_from_project_root(project_root: Path) -> Path:
     project_root = project_root.expanduser().resolve()
     parent = project_root.parent
@@ -9076,6 +9106,7 @@ def _mine_exported_sidecar(
     palace_path: Path,
     runtime_root: Path,
     refresh_palace: bool = False,
+    timeout_seconds: float | None = None,
 ):
     output_root = output_root.resolve()
     palace_path = palace_path.expanduser().resolve()
@@ -9101,19 +9132,65 @@ def _mine_exported_sidecar(
     with _sidecar_runtime_environment(runtime_root):
         _ensure_dir(palace_path)
         try:
-            mine(
-                project_dir=str(output_root),
-                palace_path=str(palace_path),
-                wing_override=_project_wing(project),
-                agent="writing_sidecar",
-                limit=0,
-                dry_run=False,
-                respect_gitignore=True,
-                include_ignored=[],
-            )
+            if timeout_seconds is None:
+                mine(
+                    project_dir=str(output_root),
+                    palace_path=str(palace_path),
+                    wing_override=_project_wing(project),
+                    agent="writing_sidecar",
+                    limit=0,
+                    dry_run=False,
+                    respect_gitignore=True,
+                    include_ignored=[],
+                )
+            else:
+                _mine_exported_sidecar_subprocess(
+                    output_root=output_root,
+                    project=project,
+                    palace_path=palace_path,
+                    timeout_seconds=timeout_seconds,
+                )
         except Exception as exc:
             return _sidecar_backend_failure("mine", exc)
     return None
+
+
+def _mine_exported_sidecar_subprocess(
+    *,
+    output_root: Path,
+    project: str,
+    palace_path: Path,
+    timeout_seconds: float,
+):
+    command = [
+        sys.executable,
+        "-m",
+        "mempalace",
+        "--palace",
+        str(palace_path),
+        "mine",
+        str(output_root),
+        "--wing",
+        _project_wing(project),
+        "--agent",
+        "writing_sidecar",
+        "--limit",
+        "0",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(output_root),
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        details = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )
+        raise RuntimeError(details or f"mempalace mine exited with code {completed.returncode}")
 
 
 def _payload_mentions_project(payload: dict, project_root: Path, project_terms: list) -> bool:
