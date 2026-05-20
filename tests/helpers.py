@@ -251,12 +251,7 @@ def normalize_for_snapshot(payload, context: dict):
             if normalized_dict.get("name") == "codex_home":
                 normalized_dict["detail"] = "<CODEX_HOME_DETAIL>"
                 normalized_dict["status"] = "<CODEX_HOME_STATUS>"
-            if (
-                normalized_dict.get("type") == "file"
-                and isinstance(normalized_dict.get("path"), str)
-                and normalized_dict["path"].startswith("<OUTPUT_ROOT>\\")
-                and normalized_dict.get("size") is not None
-            ):
+            if normalized_dict.get("type") == "file" and normalized_dict.get("size") is not None:
                 normalized_dict["size"] = "<SIZE>"
             return normalized_dict
         if isinstance(value, list):
