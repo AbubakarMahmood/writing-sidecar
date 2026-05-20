@@ -255,7 +255,16 @@ def normalize_for_snapshot(payload, context: dict):
                 normalized_dict["size"] = "<SIZE>"
             return normalized_dict
         if isinstance(value, list):
-            return [normalize(item, key=key) for item in value]
+            normalized_items = [normalize(item, key=key) for item in value]
+            if all(
+                isinstance(item, dict) and "path" in item and ("mtime" in item or "modified_at" in item)
+                for item in normalized_items
+            ):
+                return sorted(
+                    normalized_items,
+                    key=lambda item: (str(item.get("room", "")), str(item.get("path", ""))),
+                )
+            return normalized_items
         if isinstance(value, str):
             normalized = value
             if key == "mempalace_version":
@@ -264,6 +273,8 @@ def normalize_for_snapshot(payload, context: dict):
                 normalized = normalized.replace(actual, placeholder)
                 normalized = normalized.replace(actual.replace("\\", "/"), placeholder)
             normalized = normalize_placeholder_paths(normalized)
+            if key == "path":
+                normalized = normalized.replace("/", "\\")
             normalized = TIMESTAMP_PATTERN.sub("<TIMESTAMP>", normalized)
             normalized = DATE_STAMP_PATTERN.sub("<DATE>", normalized)
             normalized = SHA256_PATTERN.sub("<SHA256>", normalized)
