@@ -301,16 +301,26 @@ PROJECT_SCAN_PRUNE_DIRS = {
     ".git",
     ".hg",
     ".svn",
+    ".codex",
     ".sidecars",
     ".palaces",
     ".mempalace-sidecar-runtime",
     ".pytest_cache",
     ".tmp-tests",
     "__pycache__",
+    "_archive",
+    "_inbox",
+    "_meta",
+    "_subrepos",
+    "domain-packs",
     "node_modules",
     ".venv",
     "venv",
 }
+PROJECT_SEARCH_CONTAINERS = (
+    Path("projects") / "fiction",
+    Path("projects"),
+)
 FIELD_LABELS = {
     "status": ("Status",),
     "phase": ("Phase",),
@@ -464,7 +474,15 @@ def resolve_project_root(vault_dir: str, project: str) -> Path:
         raise FileNotFoundError(f"Vault path not found: {base_path}")
 
     direct_match = base_path.name.lower() == project.lower()
-    candidate = base_path / project
+    candidate_paths = []
+    candidate_paths.append(base_path / project)
+    for container in PROJECT_SEARCH_CONTAINERS:
+        candidate_paths.append(base_path / container / project)
+    projects_root = base_path / "projects"
+    if projects_root.is_dir():
+        for child in sorted(projects_root.iterdir()):
+            if child.is_dir():
+                candidate_paths.append(child / project)
     ancestor_match = next(
         (
             ancestor
@@ -478,8 +496,9 @@ def resolve_project_root(vault_dir: str, project: str) -> Path:
         return base_path
     if ancestor_match is not None:
         return ancestor_match.resolve()
-    if candidate.is_dir():
-        return candidate.resolve()
+    for candidate in candidate_paths:
+        if candidate.is_dir():
+            return candidate.resolve()
 
     raise FileNotFoundError(
         f"Could not resolve project '{project}' from {base_path}. "
@@ -7767,13 +7786,23 @@ def _load_writing_export_config(project_root: Path, config_path: str = None):
     return data, candidate
 
 
+def _infer_vault_root_from_project_root(project_root: Path) -> Path:
+    project_root = project_root.expanduser().resolve()
+    parent = project_root.parent
+    if parent.name.lower() == "projects":
+        return parent.parent.resolve()
+    if parent.parent.name.lower() == "projects":
+        return parent.parent.parent.resolve()
+    return parent.resolve()
+
+
 def resolve_vault_root(vault_dir: str, project_root: Path) -> Path:
     """Infer the vault root even when the caller passes a direct project path."""
     base_path = Path(vault_dir).expanduser().resolve()
     if base_path.is_file():
         base_path = base_path.parent
     if base_path == project_root or project_root in base_path.parents:
-        return project_root.parent
+        return _infer_vault_root_from_project_root(project_root)
     return base_path
 
 

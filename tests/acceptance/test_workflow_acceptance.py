@@ -58,6 +58,25 @@ def test_default_writing_paths_accept_vault_root_or_project_dir():
     finally:
         cleanup_temp_dir(tmp_path)
 
+def test_project_resolution_supports_nested_projects_fiction_layout():
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "projects" / "fiction" / "Witcher-DC"
+        write_file(project_root / "writing-sidecar.yaml", "project: Witcher-DC\n")
+
+        assert resolve_project_root(str(vault_root), "Witcher-DC") == project_root.resolve()
+
+        resolved = resolve_sidecar_project(str(vault_root), "Witcher-DC")
+        assert resolved["project_root"] == project_root.resolve()
+        assert resolved["vault_root"] == vault_root.resolve()
+
+        direct = resolve_sidecar_project(str(project_root))
+        assert direct["project_root"] == project_root.resolve()
+        assert direct["vault_root"] == vault_root.resolve()
+    finally:
+        cleanup_temp_dir(tmp_path)
+
 def test_export_writing_corpus_writes_manifest_and_curates_rooms():
     tmp_path = make_temp_dir()
     try:
