@@ -6353,7 +6353,7 @@ def _latest_markdown_payload(root: Path) -> dict:
     files = [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in {".md", ".txt"}]
     if not files:
         return _missing_markdown_payload(root)
-    latest = max(files, key=lambda path: path.stat().st_mtime)
+    latest = max(files, key=lambda path: (path.stat().st_mtime, str(path).lower()))
     return _load_markdown_payload(latest)
 
 
