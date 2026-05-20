@@ -8,13 +8,8 @@ import pytest
 
 from writing_sidecar.mempalace_adapter import SUPPORTED_MEMPALACE_SPEC
 from writing_sidecar.workflow import (
-    FACT_LOG_FILENAME,
-    FACT_PREVIEW_FILENAME,
-    FACTS_SNAPSHOT_FILENAME,
+    ONNX_MODEL_CACHE_FILES,
     STATE_FILENAME,
-    _collect_carry_forward_gap_findings,
-    _build_checkpoint_sections,
-    _fact_identity,
     build_writing_automation,
     build_writing_bundle,
     build_writing_context,
@@ -60,6 +55,25 @@ def test_default_writing_paths_accept_vault_root_or_project_dir():
         assert default_runtime_dir(vault_root.resolve(), "Witcher-DC") == (
             vault_root.resolve() / ".mempalace-sidecar-runtime" / "witcher_dc"
         )
+    finally:
+        cleanup_temp_dir(tmp_path)
+
+def test_project_resolution_supports_nested_projects_fiction_layout():
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "projects" / "fiction" / "Witcher-DC"
+        write_file(project_root / "writing-sidecar.yaml", "project: Witcher-DC\n")
+
+        assert resolve_project_root(str(vault_root), "Witcher-DC") == project_root.resolve()
+
+        resolved = resolve_sidecar_project(str(vault_root), "Witcher-DC")
+        assert resolved["project_root"] == project_root.resolve()
+        assert resolved["vault_root"] == vault_root.resolve()
+
+        direct = resolve_sidecar_project(str(project_root))
+        assert direct["project_root"] == project_root.resolve()
+        assert direct["vault_root"] == vault_root.resolve()
     finally:
         cleanup_temp_dir(tmp_path)
 
@@ -111,7 +125,7 @@ def test_export_writing_corpus_writes_manifest_and_curates_rooms():
         assert len(chat_files) == 1
         assert "Arthur takes responsibility" in chat_files[0].read_text(encoding="utf-8")
         assert (output_root / ".gitignore").read_text(encoding="utf-8") == (
-            f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n"
+            f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n.writing-sidecar-verify.json\nfacts/\nhealth/\n"
         )
         assert summary["last_synced_at"]
         assert manifest["project"] == "Witcher-DC"
@@ -215,6 +229,66 @@ def test_export_writing_corpus_auto_resolves_project_name_from_project_dir():
         assert summary["project_root"] == str(project_root.resolve())
         assert manifest["project"] == "Witcher-DC"
         assert (output_root / "mempalace.yaml").exists()
+    finally:
+        cleanup_temp_dir(tmp_path)
+
+def test_config_paths_supply_runtime_defaults_and_cli_overrides():
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "projects" / "fiction" / "Witcher-DC"
+        output_root = vault_root / "_runtime" / "sidecars" / "witcher_dc"
+        palace_root = vault_root / "_runtime" / "palaces" / "witcher_dc"
+        runtime_root = vault_root / "_runtime" / "mempalace-sidecar" / "witcher_dc"
+
+        write_file(
+            project_root / "writing-sidecar.yaml",
+            textwrap.dedent(
+                """
+                paths:
+                  output_root: "{vault}/_runtime/sidecars/{project_slug}"
+                  palace_path: "{vault}/_runtime/palaces/{project_slug}"
+                  runtime_root: "{vault}/_runtime/mempalace-sidecar/{project_slug}"
+                brainstorms: []
+                audits: []
+                discarded_paths: []
+                """
+            ).strip()
+            + "\n",
+        )
+        write_file(project_root / "_story_bible" / "research" / "dc.md", "Apokolips research")
+
+        summary = export_writing_corpus(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+        )
+        status = get_writing_sidecar_status(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+        )
+
+        assert summary["output_root"] == str(output_root.resolve())
+        assert summary["palace_path"] == str(palace_root.resolve())
+        assert summary["runtime_root"] == str(runtime_root.resolve())
+        assert status["built"] is True
+        assert status["output_root"] == str(output_root.resolve())
+        assert status["palace_path"] == str(palace_root.resolve())
+        assert status["runtime_root"] == str(runtime_root.resolve())
+
+        override_output = tmp_path / "override-sidecar"
+        override_palace = tmp_path / "override-palace"
+        override_runtime = tmp_path / "override-runtime"
+        override_status = get_writing_sidecar_status(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(override_output),
+            palace_path=str(override_palace),
+            runtime_root=str(override_runtime),
+        )
+
+        assert override_status["output_root"] == str(override_output.resolve())
+        assert override_status["palace_path"] == str(override_palace.resolve())
+        assert override_status["runtime_root"] == str(override_runtime.resolve())
     finally:
         cleanup_temp_dir(tmp_path)
 
@@ -1025,6 +1099,7 @@ def test_doctor_reports_supported_version_and_writable_paths(monkeypatch, capsys
         assert report["supported_spec"] == SUPPORTED_MEMPALACE_SPEC
         assert any(item["name"] == "mempalace_version" and item["status"] == "ok" for item in report["checks"])
         assert any(item["name"] == "codex_home" and item["status"] == "warn" for item in report["checks"])
+        assert any(item["name"] == "onnx_model_cache" and item["status"] == "warn" for item in report["checks"])
         assert report["assistant_ready"] is True
         assert all(item["status"] == "ok" for item in report["workflow_checks"])
         assert report["recommended_entrypoint"] == "writing-sidecar automate"
@@ -1034,6 +1109,37 @@ def test_doctor_reports_supported_version_and_writable_paths(monkeypatch, capsys
         assert "Writing Sidecar Doctor" in output
     finally:
         cleanup_temp_dir(tmp_path)
+
+
+def test_doctor_reports_warm_onnx_model_cache(monkeypatch):
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "Witcher-DC"
+        runtime_root = tmp_path / "runtime"
+        extracted_cache = runtime_root / "cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2" / "onnx"
+        for filename in ONNX_MODEL_CACHE_FILES:
+            write_file(extracted_cache / filename, "cached")
+
+        _ensure_dir(project_root)
+        scaffold_writing_sidecar(str(vault_root), "Witcher-DC")
+        write_file(project_root / "AGENTS.md", "gateway")
+        write_file(project_root / "_story_bible" / "05_Current_Notes.md", "**Status:** READY FOR SCRIPTING\n")
+        write_file(project_root / "_story_bible" / "05_Current_Chapter_Notes.md", "**Phase:** SCRIPTING\n")
+
+        report = doctor_writing_sidecar(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            codex_home=str(tmp_path / ".codex"),
+            runtime_root=str(runtime_root),
+        )
+        onnx_check = next(item for item in report["checks"] if item["name"] == "onnx_model_cache")
+
+        assert onnx_check["status"] == "ok"
+        assert "warm" in onnx_check["detail"]
+    finally:
+        cleanup_temp_dir(tmp_path)
+
 
 def test_doctor_auto_resolves_project_name_from_project_dir():
     tmp_path = make_temp_dir()
@@ -3077,6 +3183,49 @@ def test_export_writing_corpus_records_mine_backend_failures(monkeypatch):
         cleanup_temp_dir(tmp_path)
 
 
+def test_export_writing_corpus_records_mine_timeout_from_config(monkeypatch):
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "Witcher-DC"
+        output_root = tmp_path / "sidecar"
+        palace_root = tmp_path / "palace"
+        runtime_root = tmp_path / "runtime"
+        captured = {}
+
+        write_file(
+            project_root / "writing-sidecar.yaml",
+            "backend:\n  mine_timeout_seconds: 1\nbrainstorms: []\naudits: []\ndiscarded_paths: []\n",
+        )
+        write_file(project_root / "_story_bible" / "research" / "dc.md", "Apokolips research")
+
+        def timed_out_run(command, **kwargs):
+            captured["command"] = command
+            captured["timeout"] = kwargs.get("timeout")
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout"))
+
+        monkeypatch.setattr("writing_sidecar.workflow.subprocess.run", timed_out_run)
+
+        summary = export_writing_corpus(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(output_root),
+            palace_path=str(palace_root),
+            runtime_root=str(runtime_root),
+            mine_after_export=True,
+        )
+
+        assert summary["mine_skipped"] == "backend_error"
+        assert "mine backend failure" in summary["mine_warning"]
+        assert "TimeoutExpired" in summary["mine_warning"]
+        assert captured["timeout"] == 1
+        assert "--wing" in captured["command"]
+        assert any("_writing_sidecar" in item for item in captured["command"])
+        assert (output_root / STATE_FILENAME).exists()
+    finally:
+        cleanup_temp_dir(tmp_path)
+
+
 def test_verify_writing_sidecar_survives_search_backend_failures(monkeypatch):
     tmp_path = make_temp_dir()
     try:
@@ -3241,6 +3390,77 @@ def test_build_writing_automation_skips_sidecar_queries_when_health_marks_backen
         cleanup_temp_dir(tmp_path)
 
 
+def test_build_writing_automation_does_not_skip_sidecar_queries_for_stale_p95_only(monkeypatch):
+    tmp_path = make_temp_dir()
+    try:
+        vault_root = tmp_path / "vault"
+        project_root = vault_root / "Witcher-DC"
+        output_root = tmp_path / "sidecar"
+        palace_root = tmp_path / "palace"
+        runtime_root = tmp_path / "runtime"
+
+        write_file(project_root / "writing-sidecar.yaml", "brainstorms: []\naudits: []\ndiscarded_paths: []\n")
+        write_file(
+            project_root / "_story_bible" / "05_Current_Notes.md",
+            "**Status:** CHAPTER 3 STABLE -> READY FOR CHAPTER 4\n**Next Action:** Continue the Darkseid prelude.\n",
+        )
+        write_file(
+            project_root / "_story_bible" / "05_Current_Chapter_Notes.md",
+            "**Phase:** SCRIPTING\n**Chapter:** 4\n",
+        )
+        write_file(project_root / "_story_bible" / "research" / "dc.md", "Apokolips research")
+
+        export_writing_corpus(
+            vault_dir=str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(output_root),
+            palace_path=str(palace_root),
+            runtime_root=str(runtime_root),
+        )
+        _ensure_dir(palace_root)
+
+        monkeypatch.setattr(
+            "writing_sidecar.workflow._cached_health_summary",
+            lambda *args, **kwargs: {
+                "health_metrics": {
+                    "command_families": {
+                        "query": {"sample_count": 43, "median_ms": 12977, "p95_ms": 194861}
+                    }
+                }
+            },
+        )
+
+        calls = []
+
+        def fake_search(**kwargs):
+            calls.append(kwargs)
+            return {
+                "query": kwargs["query"],
+                "wing": kwargs["wing"],
+                "mode": kwargs["mode"],
+                "room_order": list(SEARCH_MODE_ROOMS[kwargs["mode"]]),
+                "results": [],
+            }
+
+        monkeypatch.setattr("writing_sidecar.workflow.search_writing_sidecar", fake_search)
+
+        report = build_writing_automation(
+            str(vault_root),
+            project="Witcher-DC",
+            out_dir=str(output_root),
+            palace_path=str(palace_root),
+            runtime_root=str(runtime_root),
+            name="recommended",
+            verify_mode="skip",
+            sync="never",
+        )
+
+        assert calls
+        assert not any("query backend is currently too slow" in warning for warning in report["warnings"])
+    finally:
+        cleanup_temp_dir(tmp_path)
+
+
 def test_export_writing_corpus_refresh_palace_resets_health_history(monkeypatch):
     tmp_path = make_temp_dir()
     try:
@@ -3279,18 +3499,23 @@ def test_export_writing_corpus_refresh_palace_resets_health_history(monkeypatch)
 def test_search_writing_sidecar_fast_path_works_without_search_memories(monkeypatch):
     import chromadb
 
+    queries = []
+
     class FakeCollection:
         def query(self, **kwargs):
+            queries.append(kwargs)
             return {
                 "documents": [[
                     "Arthur sponsorship and Atlantis intake.",
                     "Checkpoint mentions Atlantis intake.",
+                    "Older checkpoint also mentions Atlantis intake.",
                 ]],
                 "metadatas": [[
                     {"wing": "witcher_dc_writing_sidecar", "room": "brainstorms", "source_file": "handoff.md"},
                     {"wing": "witcher_dc_writing_sidecar", "room": "checkpoints", "source_file": "checkpoint.md"},
+                    {"wing": "witcher_dc_writing_sidecar", "room": "checkpoints", "source_file": "older-checkpoint.md"},
                 ]],
-                "distances": [[0.1, 0.2]],
+                "distances": [[0.1, 0.2, 0.3]],
             }
 
     class FakeClient:
@@ -3311,9 +3536,14 @@ def test_search_writing_sidecar_fast_path_works_without_search_memories(monkeypa
         palace_path="C:/fake-palace",
         wing="witcher_dc_writing_sidecar",
         mode="planning",
-        n_results=2,
+        n_results=3,
     )
 
     assert result["results"]
-    assert [hit["room"] for hit in result["results"]] == ["checkpoints", "brainstorms"]
-
+    assert [hit["room"] for hit in result["results"]] == ["checkpoints", "brainstorms", "checkpoints"]
+    assert queries[0]["where"] == {
+        "$and": [
+            {"wing": "witcher_dc_writing_sidecar"},
+            {"room": {"$in": list(SEARCH_MODE_ROOMS["planning"])}},
+        ]
+    }

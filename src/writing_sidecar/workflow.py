@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import hashlib
 from contextlib import contextmanager
@@ -26,6 +27,7 @@ from typing import Iterable, Sequence
 import yaml
 
 from .health import (
+    HEALTH_DIRNAME,
     begin_health_command,
     command_family as health_command_family,
     describe_health_reason,
@@ -49,6 +51,8 @@ DEFAULT_WRITING_CONFIG_FILENAMES = ("writing-sidecar.yaml", "writing-sidecar.yml
 DEFAULT_SIDECAR_OUTPUT_DIRNAME = ".sidecars"
 DEFAULT_SIDECAR_PALACE_DIRNAME = ".palaces"
 DEFAULT_RUNTIME_DIRNAME = ".mempalace-sidecar-runtime"
+CONFIG_PATH_SECTION = "paths"
+CONFIG_PATH_KEYS = ("output_root", "palace_path", "runtime_root")
 STATE_FILENAME = ".writing-sidecar-state.json"
 VERIFY_CACHE_FILENAME = ".writing-sidecar-verify.json"
 FACTS_DIRNAME = "facts"
@@ -59,7 +63,7 @@ STATE_VERSION = 3
 DOCUMENT_ID_VERSION = 1
 DOCUMENT_TAG_VERSION = 1
 SEARCH_MODE_ROOMS = {
-    "planning": ("checkpoints", "brainstorms", "discarded_paths", "audits", "chat_process"),
+    "planning": ("checkpoints", "brainstorms", "discarded_paths", "audits"),
     "audit": ("audits", "discarded_paths", "checkpoints", "chat_process", "archived_notes"),
     "history": ("checkpoints", "audits", "brainstorms", "discarded_paths", "chat_process"),
     "research": ("research", "archived_notes"),
@@ -167,7 +171,14 @@ ROLLOUT_SCAN_MAX_BYTES = 16 * 1024 * 1024
 ROLLOUT_SCAN_MAX_LINES = 25000
 QUERY_BACKEND_SKIP_SAMPLE_COUNT = 3
 QUERY_BACKEND_SKIP_MEDIAN_MS = 15000
-QUERY_BACKEND_SKIP_P95_MS = 45000
+ONNX_MODEL_CACHE_FILES = (
+    "config.json",
+    "model.onnx",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "vocab.txt",
+)
 ROOM_DESCRIPTIONS = {
     "chat_process": "Normalized AI conversations and process chatter tied to this project.",
     "checkpoints": "Structured session-safe checkpoints captured during startup, planning, and closeout.",
@@ -293,16 +304,26 @@ PROJECT_SCAN_PRUNE_DIRS = {
     ".git",
     ".hg",
     ".svn",
+    ".codex",
     ".sidecars",
     ".palaces",
     ".mempalace-sidecar-runtime",
     ".pytest_cache",
     ".tmp-tests",
     "__pycache__",
+    "_archive",
+    "_inbox",
+    "_meta",
+    "_subrepos",
+    "domain-packs",
     "node_modules",
     ".venv",
     "venv",
 }
+PROJECT_SEARCH_CONTAINERS = (
+    Path("projects") / "fiction",
+    Path("projects"),
+)
 FIELD_LABELS = {
     "status": ("Status",),
     "phase": ("Phase",),
@@ -456,7 +477,15 @@ def resolve_project_root(vault_dir: str, project: str) -> Path:
         raise FileNotFoundError(f"Vault path not found: {base_path}")
 
     direct_match = base_path.name.lower() == project.lower()
-    candidate = base_path / project
+    candidate_paths = []
+    candidate_paths.append(base_path / project)
+    for container in PROJECT_SEARCH_CONTAINERS:
+        candidate_paths.append(base_path / container / project)
+    projects_root = base_path / "projects"
+    if projects_root.is_dir():
+        for child in sorted(projects_root.iterdir()):
+            if child.is_dir():
+                candidate_paths.append(child / project)
     ancestor_match = next(
         (
             ancestor
@@ -470,8 +499,9 @@ def resolve_project_root(vault_dir: str, project: str) -> Path:
         return base_path
     if ancestor_match is not None:
         return ancestor_match.resolve()
-    if candidate.is_dir():
-        return candidate.resolve()
+    for candidate in candidate_paths:
+        if candidate.is_dir():
+            return candidate.resolve()
 
     raise FileNotFoundError(
         f"Could not resolve project '{project}' from {base_path}. "
@@ -618,24 +648,35 @@ def _prepare_writing_context(
     project_name = resolved_project["project"]
     project_root = resolved_project["project_root"]
     vault_root = resolved_project["vault_root"]
+    writing_config, loaded_config_path = _load_writing_export_config(project_root, config_path)
+    config_base_dir = loaded_config_path.parent if loaded_config_path else project_root
+    config_paths = _resolve_config_path_defaults(
+        writing_config,
+        config_base_dir=config_base_dir,
+        vault_root=vault_root,
+        project_root=project_root,
+        project=project_name,
+    )
+    mine_timeout_seconds = _resolve_mine_timeout_seconds(writing_config)
     output_root = (
         Path(out_dir).expanduser().resolve()
         if out_dir
-        else default_output_dir(vault_root, project_name).resolve()
+        else config_paths.get("output_root")
+        or default_output_dir(vault_root, project_name).resolve()
     )
     codex_root = Path(codex_home).expanduser().resolve() if codex_home else DEFAULT_CODEX_HOME
     target_palace = (
         Path(palace_path).expanduser().resolve()
         if palace_path
-        else default_palace_dir(vault_root, project_name).resolve()
+        else config_paths.get("palace_path")
+        or default_palace_dir(vault_root, project_name).resolve()
     )
     sidecar_runtime_root = (
         Path(runtime_root).expanduser().resolve()
         if runtime_root
-        else default_runtime_dir(vault_root, project_name).resolve()
+        else config_paths.get("runtime_root")
+        or default_runtime_dir(vault_root, project_name).resolve()
     )
-    writing_config, loaded_config_path = _load_writing_export_config(project_root, config_path)
-    config_base_dir = loaded_config_path.parent if loaded_config_path else project_root
     project_terms = _build_project_terms(
         project_name,
         project_root,
@@ -666,6 +707,7 @@ def _prepare_writing_context(
         "codex_root": codex_root,
         "palace_path": target_palace,
         "runtime_root": sidecar_runtime_root,
+        "mine_timeout_seconds": mine_timeout_seconds,
         "writing_config": writing_config,
         "loaded_config_path": loaded_config_path,
         "generated_config_path": output_root / "mempalace.yaml",
@@ -835,13 +877,16 @@ def export_writing_corpus(
         if dry_run:
             summary["mine_skipped"] = "dry_run"
         else:
-            mine_warning = _mine_exported_sidecar(
-                output_root=context["output_root"],
-                project=context["project"],
-                palace_path=context["palace_path"],
-                runtime_root=context["runtime_root"],
-                refresh_palace=refresh_palace,
-            )
+            mine_kwargs = {
+                "output_root": context["output_root"],
+                "project": context["project"],
+                "palace_path": context["palace_path"],
+                "runtime_root": context["runtime_root"],
+                "refresh_palace": refresh_palace,
+            }
+            if context["mine_timeout_seconds"] is not None:
+                mine_kwargs["timeout_seconds"] = context["mine_timeout_seconds"]
+            mine_warning = _mine_exported_sidecar(**mine_kwargs)
             if mine_warning:
                 summary["mine_skipped"] = "backend_error"
                 summary["mine_warning"] = mine_warning
@@ -1214,6 +1259,28 @@ def _merge_search_hits(keyword_hits: list[dict], vector_hits: list[dict], n_resu
     return merged
 
 
+def _prioritize_room_hits(rooms: Sequence[str], buckets: dict[str, list[dict]], mode: str) -> list[dict]:
+    per_room: dict[str, list[dict]] = {room: [] for room in rooms}
+    seen = set()
+    for room in rooms:
+        for hit in buckets.get(room, []):
+            key = (hit.get("source_file"), hit.get("text"))
+            if key in seen:
+                continue
+            seen.add(key)
+            hit["mode"] = mode
+            per_room[room].append(hit)
+
+    primary = []
+    deferred = []
+    for room in rooms:
+        if not per_room[room]:
+            continue
+        primary.append(per_room[room][0])
+        deferred.extend(per_room[room][1:])
+    return primary + deferred
+
+
 def search_writing_sidecar(
     query: str,
     palace_path: str,
@@ -1259,10 +1326,7 @@ def search_writing_sidecar(
             fast_packet["profile"] = explicit_profile
         return fast_packet
 
-    primary = []
-    deferred = []
-    seen = set()
-    seen_sources = set()
+    buckets = {room: [] for room in rooms}
     room_limit = _retrieval_room_limit(n_results, budget)
     for room in rooms:
         try:
@@ -1290,19 +1354,9 @@ def search_writing_sidecar(
         if results.get("error"):
             return results
         for hit in results.get("results", []):
-            key = (hit.get("source_file"), hit.get("text"))
-            if key in seen:
-                continue
-            seen.add(key)
-            hit["mode"] = mode
-            source_key = hit.get("source_file") or f"{room}:{len(seen)}"
-            if source_key not in seen_sources:
-                seen_sources.add(source_key)
-                primary.append(hit)
-            else:
-                deferred.append(hit)
+            buckets.setdefault(room, []).append(hit)
 
-    merged = _merge_search_hits(keyword_hits, primary + deferred, n_results, mode)
+    merged = _merge_search_hits(keyword_hits, _prioritize_room_hits(rooms, buckets, mode), n_results, mode)
 
     packet = {
         "query": query,
@@ -1333,7 +1387,7 @@ def _search_writing_sidecar_fast(
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         query_limit = _retrieval_candidate_limit(n_results, len(rooms), budget)
-        where = {"wing": wing} if wing else None
+        where = _sidecar_fast_where_filter(wing, rooms)
         kwargs = {
             "query_texts": [query],
             "n_results": query_limit,
@@ -1365,25 +1419,7 @@ def _search_writing_sidecar_fast(
             }
         )
 
-    primary = []
-    deferred = []
-    seen = set()
-    seen_sources = set()
-    for room in rooms:
-        for hit in buckets[room]:
-            key = (hit.get("source_file"), hit.get("text"))
-            if key in seen:
-                continue
-            seen.add(key)
-            hit["mode"] = mode
-            source_key = hit.get("source_file") or f"{room}:{len(seen)}"
-            if source_key not in seen_sources:
-                seen_sources.add(source_key)
-                primary.append(hit)
-            else:
-                deferred.append(hit)
-
-    merged = (primary + deferred)[:n_results]
+    merged = _prioritize_room_hits(rooms, buckets, mode)[:n_results]
     packet = {
         "query": query,
         "wing": wing,
@@ -1394,6 +1430,19 @@ def _search_writing_sidecar_fast(
     if budget != "normal":
         packet["budget"] = budget
     return packet
+
+
+def _sidecar_fast_where_filter(wing: str, rooms: Sequence[str]) -> dict | None:
+    clauses = []
+    if wing:
+        clauses.append({"wing": wing})
+    if rooms:
+        clauses.append({"room": {"$in": list(rooms)}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
 
 
 def print_writing_search_results(search_data: dict):
@@ -4772,7 +4821,6 @@ def _build_single_maintenance_artifact(
     project_name = status["project"]
     date_stamp = datetime.now().astimezone().strftime("%Y-%m-%d")
     phase = _extract_phase(doc_bundle)
-    current_status = _extract_field(doc_bundle, "status") or "TBD"
     next_action = _extract_field(doc_bundle, "next_action") or "TBD"
     working_title = _extract_field(doc_bundle, "working_title")
 
@@ -5962,8 +6010,7 @@ def _sidecar_query_circuit_breaker(status: dict) -> str | None:
         return None
 
     median_too_slow = median_ms is not None and median_ms >= QUERY_BACKEND_SKIP_MEDIAN_MS
-    p95_too_slow = p95_ms is not None and p95_ms >= QUERY_BACKEND_SKIP_P95_MS
-    if not (median_too_slow or p95_too_slow):
+    if not median_too_slow:
         return None
 
     return (
@@ -7757,13 +7804,108 @@ def _load_writing_export_config(project_root: Path, config_path: str = None):
     return data, candidate
 
 
+def _resolve_config_path_defaults(
+    writing_config: dict,
+    *,
+    config_base_dir: Path,
+    vault_root: Path,
+    project_root: Path,
+    project: str,
+) -> dict[str, Path]:
+    paths_config = writing_config.get(CONFIG_PATH_SECTION, {})
+    if paths_config is None:
+        paths_config = {}
+    if not isinstance(paths_config, dict):
+        raise ValueError("Writing sidecar paths config must be a mapping")
+
+    defaults = {}
+    for key in CONFIG_PATH_KEYS:
+        raw_path = paths_config.get(key, writing_config.get(key))
+        resolved = _resolve_config_path_value(
+            raw_path,
+            key=key,
+            config_base_dir=config_base_dir,
+            vault_root=vault_root,
+            project_root=project_root,
+            project=project,
+        )
+        if resolved is not None:
+            defaults[key] = resolved
+    return defaults
+
+
+def _resolve_config_path_value(
+    raw_path,
+    *,
+    key: str,
+    config_base_dir: Path,
+    vault_root: Path,
+    project_root: Path,
+    project: str,
+) -> Path | None:
+    if raw_path in (None, ""):
+        return None
+    if not isinstance(raw_path, (str, Path)):
+        raise ValueError(f"Writing sidecar paths.{key} must be a string path")
+
+    value = os.path.expandvars(str(raw_path))
+    replacements = {
+        "vault": str(vault_root),
+        "vault_root": str(vault_root),
+        "project_root": str(project_root),
+        "project": project,
+        "project_slug": _project_slug(project),
+    }
+    for token, replacement in replacements.items():
+        value = value.replace(f"{{{token}}}", replacement)
+
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = config_base_dir / candidate
+    return candidate.resolve()
+
+
+def _resolve_mine_timeout_seconds(writing_config: dict) -> float | None:
+    backend_config = writing_config.get("backend", {})
+    if backend_config is None:
+        backend_config = {}
+    if not isinstance(backend_config, dict):
+        raise ValueError("Writing sidecar backend config must be a mapping")
+
+    raw_timeout = backend_config.get(
+        "mine_timeout_seconds",
+        writing_config.get("mine_timeout_seconds"),
+    )
+    if raw_timeout in (None, ""):
+        return None
+    if raw_timeout is False:
+        return None
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Writing sidecar backend.mine_timeout_seconds must be a number") from exc
+    if timeout <= 0:
+        raise ValueError("Writing sidecar backend.mine_timeout_seconds must be greater than zero")
+    return timeout
+
+
+def _infer_vault_root_from_project_root(project_root: Path) -> Path:
+    project_root = project_root.expanduser().resolve()
+    parent = project_root.parent
+    if parent.name.lower() == "projects":
+        return parent.parent.resolve()
+    if parent.parent.name.lower() == "projects":
+        return parent.parent.parent.resolve()
+    return parent.resolve()
+
+
 def resolve_vault_root(vault_dir: str, project_root: Path) -> Path:
     """Infer the vault root even when the caller passes a direct project path."""
     base_path = Path(vault_dir).expanduser().resolve()
     if base_path.is_file():
         base_path = base_path.parent
     if base_path == project_root or project_root in base_path.parents:
-        return project_root.parent
+        return _infer_vault_root_from_project_root(project_root)
     return base_path
 
 
@@ -8522,7 +8664,6 @@ def _extract_fact_candidates(status: dict, bundle: dict, scope: str) -> list[dic
 
     current_notes = bundle.get("current_notes", {})
     current_chapter = bundle.get("current_chapter_notes", {})
-    story_so_far = bundle.get("story_so_far", {})
 
     project_fact_specs = (
         (current_notes, "current_notes", "status", "project_state", "project", "status"),
@@ -8965,6 +9106,7 @@ def _mine_exported_sidecar(
     palace_path: Path,
     runtime_root: Path,
     refresh_palace: bool = False,
+    timeout_seconds: float | None = None,
 ):
     output_root = output_root.resolve()
     palace_path = palace_path.expanduser().resolve()
@@ -8990,19 +9132,65 @@ def _mine_exported_sidecar(
     with _sidecar_runtime_environment(runtime_root):
         _ensure_dir(palace_path)
         try:
-            mine(
-                project_dir=str(output_root),
-                palace_path=str(palace_path),
-                wing_override=_project_wing(project),
-                agent="writing_sidecar",
-                limit=0,
-                dry_run=False,
-                respect_gitignore=True,
-                include_ignored=[],
-            )
+            if timeout_seconds is None:
+                mine(
+                    project_dir=str(output_root),
+                    palace_path=str(palace_path),
+                    wing_override=_project_wing(project),
+                    agent="writing_sidecar",
+                    limit=0,
+                    dry_run=False,
+                    respect_gitignore=True,
+                    include_ignored=[],
+                )
+            else:
+                _mine_exported_sidecar_subprocess(
+                    output_root=output_root,
+                    project=project,
+                    palace_path=palace_path,
+                    timeout_seconds=timeout_seconds,
+                )
         except Exception as exc:
             return _sidecar_backend_failure("mine", exc)
     return None
+
+
+def _mine_exported_sidecar_subprocess(
+    *,
+    output_root: Path,
+    project: str,
+    palace_path: Path,
+    timeout_seconds: float,
+):
+    command = [
+        sys.executable,
+        "-m",
+        "mempalace",
+        "--palace",
+        str(palace_path),
+        "mine",
+        str(output_root),
+        "--wing",
+        _project_wing(project),
+        "--agent",
+        "writing_sidecar",
+        "--limit",
+        "0",
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(output_root),
+        text=True,
+        capture_output=True,
+        timeout=timeout_seconds,
+    )
+    if completed.returncode != 0:
+        details = "\n".join(
+            part.strip()
+            for part in (completed.stdout, completed.stderr)
+            if part and part.strip()
+        )
+        raise RuntimeError(details or f"mempalace mine exited with code {completed.returncode}")
 
 
 def _payload_mentions_project(payload: dict, project_root: Path, project_terms: list) -> bool:
@@ -9339,7 +9527,10 @@ def _ensure_dir(path: Path):
 def _write_export_gitignore(output_root: Path):
     gitignore_path = output_root / ".gitignore"
     gitignore_path.write_text(
-        f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n",
+        (
+            f"entities.json\nmempalace.yaml\n{STATE_FILENAME}\n{VERIFY_CACHE_FILENAME}\n"
+            f"{FACTS_DIRNAME}/\n{HEALTH_DIRNAME}/\n"
+        ),
         encoding="utf-8",
     )
 
@@ -9367,7 +9558,7 @@ def _sidecar_runtime_environment(runtime_root: Path):
     home_root = runtime_root / "home"
     cache_root = runtime_root / "cache"
     tmp_root = runtime_root / "tmp"
-    chroma_cache_root = cache_root / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+    chroma_cache_root = _onnx_model_cache_dir(runtime_root)
 
     for path in (runtime_root, home_root, cache_root, tmp_root, chroma_cache_root):
         _ensure_dir(path)
@@ -9427,6 +9618,47 @@ def _sidecar_runtime_environment(runtime_root: Path):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = old_value
+
+
+def _onnx_model_cache_dir(runtime_root: Path) -> Path:
+    return (
+        Path(runtime_root).expanduser().resolve()
+        / "cache"
+        / "chroma"
+        / "onnx_models"
+        / "all-MiniLM-L6-v2"
+    )
+
+
+def _check_onnx_model_cache(runtime_root: Path) -> tuple[str, Path, str]:
+    cache_dir = _onnx_model_cache_dir(runtime_root)
+    extracted_dir = cache_dir / "onnx"
+    missing = [name for name in ONNX_MODEL_CACHE_FILES if not (extracted_dir / name).exists()]
+    if not missing:
+        return "ok", cache_dir, "Chroma ONNX model cache is warm."
+
+    archive_path = cache_dir / "onnx.tar.gz"
+    if archive_path.exists():
+        try:
+            archive_size = archive_path.stat().st_size / (1024 * 1024)
+            archive_detail = f"archive exists ({archive_size:.1f} MB)"
+        except OSError:
+            archive_detail = "archive exists"
+        missing_preview = ", ".join(missing[:3])
+        if len(missing) > 3:
+            missing_preview += ", ..."
+        return (
+            "warn",
+            cache_dir,
+            "Chroma ONNX model cache is partial; "
+            f"{archive_detail}, but extracted files are missing: {missing_preview}.",
+        )
+
+    return (
+        "warn",
+        cache_dir,
+        "Chroma ONNX model cache is cold; the first embedding-backed run may download about 80 MB.",
+    )
 
 
 def doctor_writing_sidecar(
@@ -9550,6 +9782,16 @@ def doctor_writing_sidecar(
                 "detail": detail,
             }
         )
+
+    onnx_status, onnx_path, onnx_detail = _check_onnx_model_cache(context["runtime_root"])
+    checks.append(
+        {
+            "name": "onnx_model_cache",
+            "status": onnx_status,
+            "path": str(onnx_path),
+            "detail": onnx_detail,
+        }
+    )
 
     report = {
         "project": context["project"],

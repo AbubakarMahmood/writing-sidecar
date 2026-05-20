@@ -35,6 +35,8 @@ TIMESTAMP_KEYS = {
 TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")
 DATE_STAMP_PATTERN = re.compile(r"\b\d{4}-\d{2}-\d{2}(?=_)")
 SHA256_PATTERN = re.compile(r"\b[a-fA-F0-9]{64}\b")
+MEMPALACE_VERSION_PATTERN = re.compile(r"\bMemPalace \d+\.\d+\.\d+\b")
+SUPPORTED_MEMPALACE_VERSION_PATTERN = re.compile(r"Supported MemPalace version detected \(\d+\.\d+\.\d+,")
 
 
 def write_file(path: Path, content: str):
@@ -222,6 +224,18 @@ def _path_replacements(context: dict) -> list[tuple[str, str]]:
 
 def normalize_for_snapshot(payload, context: dict):
     replacements = _path_replacements(context)
+    path_placeholders = [placeholder for _, placeholder in replacements]
+    placeholder_path_pattern = re.compile(
+        "("
+        + "|".join(re.escape(placeholder) for placeholder in path_placeholders)
+        + r")((?:[\\/][^\s`\"')\],;:]+)+)"
+    )
+
+    def normalize_placeholder_paths(value: str) -> str:
+        return placeholder_path_pattern.sub(
+            lambda match: match.group(1) + match.group(2).replace("/", "\\"),
+            value,
+        )
 
     def normalize(value, *, key: str | None = None):
         if key in TIMESTAMP_KEYS and value is not None:
@@ -234,17 +248,40 @@ def normalize_for_snapshot(payload, context: dict):
             }
             if {"id", "kind", "severity"}.issubset(normalized_dict):
                 normalized_dict["id"] = f"<FINDING_ID:{normalized_dict['kind']}>"
+            if normalized_dict.get("name") == "codex_home":
+                normalized_dict["detail"] = "<CODEX_HOME_DETAIL>"
+                normalized_dict["status"] = "<CODEX_HOME_STATUS>"
+            if normalized_dict.get("type") == "file" and normalized_dict.get("size") is not None:
+                normalized_dict["size"] = "<SIZE>"
             return normalized_dict
         if isinstance(value, list):
-            return [normalize(item, key=key) for item in value]
+            normalized_items = [normalize(item, key=key) for item in value]
+            if all(
+                isinstance(item, dict) and "path" in item and ("mtime" in item or "modified_at" in item)
+                for item in normalized_items
+            ):
+                return sorted(
+                    normalized_items,
+                    key=lambda item: (str(item.get("room", "")), str(item.get("path", ""))),
+                )
+            return normalized_items
         if isinstance(value, str):
             normalized = value
+            if key == "mempalace_version":
+                return "<MEMPALACE_VERSION>"
             for actual, placeholder in replacements:
                 normalized = normalized.replace(actual, placeholder)
                 normalized = normalized.replace(actual.replace("\\", "/"), placeholder)
+            normalized = normalize_placeholder_paths(normalized)
+            if key == "path":
+                normalized = normalized.replace("/", "\\")
             normalized = TIMESTAMP_PATTERN.sub("<TIMESTAMP>", normalized)
             normalized = DATE_STAMP_PATTERN.sub("<DATE>", normalized)
             normalized = SHA256_PATTERN.sub("<SHA256>", normalized)
+            normalized = MEMPALACE_VERSION_PATTERN.sub("MemPalace <MEMPALACE_VERSION>", normalized)
+            normalized = SUPPORTED_MEMPALACE_VERSION_PATTERN.sub(
+                "Supported MemPalace version detected (<MEMPALACE_VERSION>,", normalized
+            )
             return normalized
         return value
 
@@ -252,7 +289,7 @@ def normalize_for_snapshot(payload, context: dict):
 
 
 def assert_matches_json_snapshot(actual_payload, snapshot_file: Path, context: dict):
-    expected = json.loads(snapshot_file.read_text(encoding="utf-8"))
+    expected = normalize_for_snapshot(json.loads(snapshot_file.read_text(encoding="utf-8")), context)
     actual = normalize_for_snapshot(actual_payload, context)
     if actual == expected:
         return

@@ -7,18 +7,18 @@
   "runtime_root": "<RUNTIME_ROOT>",
   "codex_home": "<CODEX_HOME>",
   "config_path": "<PROJECT_ROOT>\\writing-sidecar.yaml",
-  "mempalace_version": "3.3.2",
+  "mempalace_version": "<MEMPALACE_VERSION>",
   "supported_spec": ">=3.1,<3.4",
   "checks": [
     {
       "name": "mempalace_installed",
       "status": "ok",
-      "detail": "MemPalace 3.3.2 is installed."
+      "detail": "MemPalace <MEMPALACE_VERSION> is installed."
     },
     {
       "name": "mempalace_version",
       "status": "ok",
-      "detail": "Supported MemPalace version detected (3.3.2, expected >=3.1,<3.4)."
+      "detail": "Supported MemPalace version detected (<MEMPALACE_VERSION>, expected >=3.1,<3.4)."
     },
     {
       "name": "codex_home",
@@ -43,6 +43,12 @@
       "status": "ok",
       "path": "<RUNTIME_ROOT>",
       "detail": "Writable."
+    },
+    {
+      "name": "onnx_model_cache",
+      "status": "warn",
+      "path": "<RUNTIME_ROOT>\\cache\\chroma\\onnx_models\\all-MiniLM-L6-v2",
+      "detail": "Chroma ONNX model cache is cold; the first embedding-backed run may download about 80 MB."
     }
   ],
   "workflow_checks": [
