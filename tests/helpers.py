@@ -225,6 +225,17 @@ def _path_replacements(context: dict) -> list[tuple[str, str]]:
 def normalize_for_snapshot(payload, context: dict):
     replacements = _path_replacements(context)
     path_placeholders = [placeholder for _, placeholder in replacements]
+    placeholder_path_pattern = re.compile(
+        "("
+        + "|".join(re.escape(placeholder) for placeholder in path_placeholders)
+        + r")((?:[\\/][^\s`\"')\],;:]+)+)"
+    )
+
+    def normalize_placeholder_paths(value: str) -> str:
+        return placeholder_path_pattern.sub(
+            lambda match: match.group(1) + match.group(2).replace("/", "\\"),
+            value,
+        )
 
     def normalize(value, *, key: str | None = None):
         if key in TIMESTAMP_KEYS and value is not None:
@@ -254,8 +265,7 @@ def normalize_for_snapshot(payload, context: dict):
             for actual, placeholder in replacements:
                 normalized = normalized.replace(actual, placeholder)
                 normalized = normalized.replace(actual.replace("\\", "/"), placeholder)
-            for placeholder in path_placeholders:
-                normalized = normalized.replace(f"{placeholder}/", f"{placeholder}\\")
+            normalized = normalize_placeholder_paths(normalized)
             normalized = TIMESTAMP_PATTERN.sub("<TIMESTAMP>", normalized)
             normalized = DATE_STAMP_PATTERN.sub("<DATE>", normalized)
             normalized = SHA256_PATTERN.sub("<SHA256>", normalized)
