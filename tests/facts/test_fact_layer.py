@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -15,6 +16,7 @@ from writing_sidecar.workflow import (
     _collect_carry_forward_gap_findings,
     _build_checkpoint_sections,
     _fact_identity,
+    _latest_markdown_payload,
     build_writing_automation,
     build_writing_bundle,
     build_writing_context,
@@ -40,6 +42,28 @@ from writing_sidecar.workflow import (
     verify_writing_sidecar,
 )
 from tests.helpers import build_codex_rollout, cleanup_temp_dir, make_temp_dir, write_file
+
+
+def test_latest_markdown_payload_breaks_mtime_ties_by_path_name():
+    tmp_path = make_temp_dir()
+    try:
+        checkpoint_root = tmp_path / "logs" / "checkpoints"
+        old_checkpoint = checkpoint_root / "2026-05-16_chapter-32_session_checkpoint.md"
+        new_checkpoint = checkpoint_root / "2026-05-20_chapter-32_session_checkpoint.md"
+        write_file(old_checkpoint, "# Old checkpoint\n\n## Suggested Next Loadout\n\n- latest audit output\n")
+        write_file(new_checkpoint, "# New checkpoint\n\n## Current Focus\n\n- CDLC Phase: SCRIPTING\n")
+
+        same_time = 1_700_000_000
+        os.utime(old_checkpoint, (same_time, same_time))
+        os.utime(new_checkpoint, (same_time, same_time))
+
+        payload = _latest_markdown_payload(checkpoint_root)
+
+        assert payload["path"].endswith("2026-05-20_chapter-32_session_checkpoint.md")
+        assert "CDLC Phase: SCRIPTING" in payload["text"]
+    finally:
+        cleanup_temp_dir(tmp_path)
+
 
 def test_verify_ignores_ordinary_draft_language_and_filters_low_signal_artifact_lines():
     tmp_path = make_temp_dir()
