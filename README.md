@@ -17,7 +17,7 @@ Tested target:
 
 ```bash
 pip install mempalace
-pip install "git+https://github.com/AbubakarMahmood1/writing-sidecar.git"
+pip install "git+https://github.com/AbubakarMahmood/writing-sidecar.git"
 ```
 
 If you want exact parity with your local forked MemPalace checkout while testing:

@@ -40,9 +40,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/AbubakarMahmood1/writing-sidecar"
-Repository = "https://github.com/AbubakarMahmood1/writing-sidecar"
-Issues = "https://github.com/AbubakarMahmood1/writing-sidecar/issues"
+Homepage = "https://github.com/AbubakarMahmood/writing-sidecar"
+Repository = "https://github.com/AbubakarMahmood/writing-sidecar"
+Issues = "https://github.com/AbubakarMahmood/writing-sidecar/issues"
 
 [project.scripts]
 writing-sidecar = "writing_sidecar.cli:main"
